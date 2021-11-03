@@ -25,7 +25,7 @@ VARCHAR(10)	'Bergma'	+ EXTENT_1		; 06 Byte ASCII
 ...
 ..
 .
-EXTENT_1	'nn'	;  1 Speicherseite = 8kB 
+EXTENT_1	'nn'	;  1 Speicherseite = 8kB  ==  1 Speicherblock = 64 kB
 
 NCHAR(10)	N'Krause....'				; 10 Byte Content + 10 Byte UTF-8
 
@@ -227,6 +227,13 @@ order by companyname
 SELECT DISTINCT
 		co.companyname
 FROM	dbo.Customers AS co
+		LEFT JOIN dbo.Orders AS od ON co.CustomerID = od.CustomerID
+ORDER BY co.companyname
+
+
+SELECT DISTINCT
+		co.companyname
+FROM	dbo.Customers AS co
 		INNER JOIN dbo.Orders AS od ON co.CustomerID = od.CustomerID
 ORDER BY co.companyname
 
@@ -234,7 +241,7 @@ ORDER BY co.companyname
 SELECT	DISTINCT
 		co.companyname
 FROM	dbo.Customers AS co
-WHERE	CustomerID IN
+WHERE	CustomerID NOT IN
 		( SELECT DISTINCT 
 				SQ1.CustomerID
 		  FROM dbo.Orders AS SQ1)
@@ -261,7 +268,7 @@ ORDER BY co.companyname
 -- ###########################################################################################
 
 -- WHERE NOT IN gegen DISTINCT SELECT ist <IM REGELFALL> schneller als LEFT OUTER JOIN
--- INNER JOIN ist <HÄUFIG> schneller als FULL LEFT JOIN; knappe Entscheidung bei vielen Daten
+-- FULL LEFT JOIN ist <HÄUFIG> schneller als INNER JOIN; knappe Entscheidung bei vielen Daten
 -- FULL LEFT JOIN ist <IMMER> schneller als WHERE IN gegen DISTINCT SELECT, da keine Filterung
 
 -- ###########################################################################################
@@ -272,14 +279,37 @@ ORDER BY co.companyname
 
 -- ######################################################
 
-	'[...]'
+	Plan erklärt mir nur, WO der SQL die Daten holt, WIE er das macht und WAS er damit tut
+	JEDER Plan stellt einen AnwendungsBatch dar = 100% anteilig verteilt zum Verbrauch
+	geschätzter / tatsächlicher / Echtzeit- Plan 
+	'RELATIVER' Aufwand in RessourcenEinheiten bzgl. FLOP (I/O) TIME (CPU)
+
+	-> 'NICHT BEKANNT' : WAIT-Time, RAM-Verbauch, keine ABSOLUT vergleichbaren Werte 
 
 -- ######################################################
 
-select * from orders where freight < 1			-- 50%
-select * from orders where freight > 100		-- 50%
+select * from orders where freight < 1				-- 50%  024 E  0.018 $  22 READ  000 CPU   372 TIME
+select * from orders where freight > 100			-- 50%  187 E  0.018 $  22 READ  000 CPU   392 TIME
 
-	'[...]'
+	' dbo.Orders > Indexes > Rechtsklick > Non Clustered Index [freight ASC] INCL [Rest] '
+
+select * from orders where freight < 1				-- 34%  024E  0.003 $   02 READ  000 CPU   250 TIME
+select * from orders where freight > 100			-- 66%  187E  0.006 $   07       000       390 
+
+select * from orders where freight < 1				-- 49%  024E  0.003 $	02		 000	   256
+select TOP 10 * from orders where freight > 100		-- 51%  010E  0.003 $   02       000       200
+
+	' schmeiße den neuen INDEX weg '
+
+select * from orders where freight < 1				-- 82%  024E  0.018$    22		 000	   250
+select TOP 10 * from orders where freight > 100		-- 18%  010E  0.004$	04		 000	   250
+
+	' verweise bewusst auf einen schon existierenden INDEX '
+
+select * from orders 
+		WITH (INDEX = OrderDate) where freight < 1	-- 75%  024E  0.202$	1724	000			260
+select TOP 10 * from orders 
+		WITH (INDEX = OrderDate) where freight > 100-- 25%  010E  0.067$	126		000			200
 
 -- ###########################################################################################
 -- #### Erkenntnis #3 : Ablauf-Pläne und Ausloben von Indizes gehen optimal Hand in Hand #####
@@ -302,12 +332,16 @@ select * from orders where freight > 100		-- 50%
 create proc gpdemo1 
 as
 select getdate()
-
+		--> Rekursion und damit 0 + 31 Selbstaufrufe
 exec gpdemo1
 
 -----------------------------------------------------------------
 
-	'[...]' 
+ALTER proc gpdemo1	--> wird bei SQL SVR 2016 und früher tendentiell nicht funktionieren
+as					--> dann: DROP PROC && CREATE PROC
+select getdate()
+GO		--> Mache hier nur dann weiter, WENN davor erfolgreich
+exec gpdemo1
 
 -- ######################################################
 
@@ -318,11 +352,14 @@ exec gpdemo1
 declare @var1 as int = 1
 select @var1
 
-select @var1 
+select @var1	--> 2x der Wert der Variable zur Laufzeit bekannt
 
 -----------------------------------------------------------------
 
-	'[...]' 
+declare @var1 as int = 1
+select @var1
+GO					--> neues "Blatt"
+select @var1	--> ERROR, da Variable WEG 
 
 -- ###########################################################################################
 -- #### Erkenntnis #4 : Batch-Delimiter 'GO' essentiell für Fehler-freie TSQL-Ausführung #####
@@ -349,7 +386,7 @@ select @var1
 	ein Plan kann lügen --> Unterschied zwischen geschätztem und tatsächlichem Plan
 	> vor allem bei FUNCTION(), denn die werden in tats. Plänen oft nicht mehr angezeigt!
 	> ein Plan kann durchaus mal sagen, dass Batch^1 günstiger wäre als Batch^2 (Heuristik!)
-	> die Messung kann das Gegenteilt zeigen, also dass Batch^1 günstiger als Batch^2 ist
+	> die Messung kann das Gegenteil zeigen, also dass Batch^1 günstiger als Batch^2 ist
 */
 
 -- ######################################################
@@ -366,13 +403,15 @@ select @var1
 
 -- ### statistische Abfrage zu I/O einschalten
 
-set statistics io, time off -- ZENTRALES Einschalten der Messung
+set statistics io, time on -- ZENTRALES Einschalten der Messung
 
 select * from orders where freight < 10
 
 -----------------------------------------------------------------
 
-	'[...]' 
+	logical reads 22, CPU time = 0 ms,  elapsed time = 349 ms.
+
+	' siehe Excel-Mappe > STORAGE '
 
 -- ######################################################
 
@@ -392,8 +431,16 @@ select * from orders where freight < 10
 */
 
 create table t1 (id int identity, SpalteX char(4100), SpalteY char(4100)) 
+	--				11							4100				4100	= 8211 > 8060 - 7			
+	' Grundsätzlich muss ein Datensatz in eine Seite passen! '
 
-	'[...]'
+-- Type-Definitionen
+/*
+	REFERENZ :: https://msdn.microsoft.com/de-de/library/ms187752(v=sql.120).aspx 
+*/
+
+create table t1 (id int identity, SpalteX varchar(4100), SpalteY char(4100)) 
+	' Tabelle wird NICHT abgelehnt, aber irgendwann ein Datensatz maximal möglicher Länge! '
 
 -- ######################################################
 
@@ -584,7 +631,11 @@ create table tab1 (id int identity, SpalteX char(4100)) -- sehr breite Tabelle
 	-- CRM hat meist sehr breite Tabellen
 	-- Spalten wie : fax1, fax2, fax3, Hobby1, Hobby2, Frau1, Frau2, Frau3, Frau4, Religion
 
-	'[...]'
+INSERT INTO tab1
+SELECT '##'
+GO 20000
+
+SELECT * FROM Tab1 
 
 -- ### Show Contingent : Seiten | Blöcke | ScanDichte | SeitenDichte | ...
 
