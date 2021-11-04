@@ -513,6 +513,36 @@ print 'Ausführungszeit Select-Into: ' + cast(@runningtime as nvarchar(5))
 
 select * from dbo.[Order Details Revised]
 
+-- ### Ideales UPDATE = Speicher-Optimiert
+drop table if exists dbo.myOrders
+go
+select * into dbo.myOrders from Sales.Orders order by OrderID		-- [KOPIE] des [ORIGINAL] angelegt
+go
+select * from dbo.myOrders order by OrderID
+
+with cteDifference				-- Wesentlich günstiger als ZEILENWEISES UPDATE wie gerade oben drüber, das SPALTENWEISES Update
+as (							-- Bei FILTERUNG schlägt es um, da dann ZEILENWEISES Update wesentlich effektiver beim Vergleich
+	select
+		o.RequiredDate as [ORIGINAL]
+		, mo.RequiredDate as [KOPIE]
+	from Sales.Orders as o inner join dbo.myOrders as mo on o.OrderID = mo.OrderID
+	-- WHERE ... 
+)
+--select * from cteDifference					-- Vergleich
+update cteDifference set [ORIGINAL] = [KOPIE]	-- Korrektur
+-- WHERE ....									-- CTE wird hier WEGGESCHMISSEN
+
+-- Erweiterung: Filterung über andere verknüpfte Tabellen
+begin transaction
+	select count(*) as CountTotal from Sales.OrderDetails
+	delete od from Sales.OrderDetails as od	--Alias der Zieltabelle MUSS nach DELETE angegeben werden
+		inner join Sales.Orders as oh on od.OrderID = oh.OrderID
+		inner join Sales.Customers as c on oh.custid = c.custid
+	where c.Country = 'Austria'
+	select count(*) as CountFiltered from Sales.OrderDetails
+commit		-- COMMIT ist das GO für TRANSACTION
+
+
 -- ###########################################################################################
 -- #### Erkenntnis #5 : Speicher-Adressierung ist fundamental für die Optimierungsoption #####
 -- ###########################################################################################
@@ -624,16 +654,16 @@ select * from dbo.[Order Details Revised]
 
 -- ######################################################
 
-drop table if exists dbo.tab1
+drop table if exists dbo.tab2
 go
 
-create table tab1 (id int identity, SpalteX char(4100)) -- sehr breite Tabelle
+create table tab2 (id int identity, SpalteX char(4100)) -- sehr breite Tabelle
 	-- CRM hat meist sehr breite Tabellen
 	-- Spalten wie : fax1, fax2, fax3, Hobby1, Hobby2, Frau1, Frau2, Frau3, Frau4, Religion
 
-INSERT INTO tab1
+INSERT INTO tab2
 SELECT '##'
-GO 20000
+GO 20000		-- 20.000 x 8kB = 160 MB
 
 SELECT * FROM Tab1 
 
@@ -641,7 +671,14 @@ SELECT * FROM Tab1
 
 dbcc showcontig('tab1')
 
-	'[...]'
+- Pages Scanned................................: 20000		-- Datensätze in Speicherseiten
+- Extents Scanned..............................: 2501		-- sehr viele Pages zum SELECT
+- Extent Switches..............................: 2500		-- keine Performance, da kein INDEX
+- Avg. Pages per Extent........................: 8.0
+- Scan Density [Best Count:Actual Count].......: 99.96% [2500:2501]	-- SCAN schlechter als SEEK
+- Extent Scan Fragmentation ...................: 0.56%		-- kaum etwas hier passiert, also keine Fragmentierung
+- Avg. Bytes Free per Page.....................: 3983.0		-- Faktische Leerstand
+- Avg. Page Density (full).....................: 50.79%		-- Datensatz pro Speicherseite
 
 -- ### SpeicherBericht
 
@@ -650,19 +687,23 @@ DataBase  > Reports  > Standard Reports > Disc Usage by TOP Tables
 
 -- ### Hochskaliertes Problem
 
-	'[...]'
+	1 MIO Datensätze x 51% Seitenauslastung = 8GB HDD = 8GB 1:1 RAM bei SELECT 
 
 --- ### ReFactoring : ReDesign durchführen
 
-	statt char lieber varchar 
+	statt char lieber varchar && char statt nchar 
 	statt EINER sehr breiter Table lieber zusätzliche AuslagerungsTabellen 
 
-	
-					'[...]' Speicherbedarf
-	[ Tabelle A ]    <<  SPLITTEN  >>       [ Tabelle B ]
- 
+	1 Datensatz allokiert 4111 Bytes
 
-					'[...]' Speicherbedarf
+					'8.0GB' Speicherbedarf
+
+	[ Tabelle A ]    <<  SPLITTEN  >>       [ Tabelle B ]
+	2 DS / 1 PAGE							80 DS / 1 PAGE ( 8050 / 100 )
+	500.000 PAGES							12.500 PAGES ( 1 MIO / 80 )
+	4.0 GB HDD								120 MB HDD ( 12.500 x 8kB )
+
+					'4.1GB' Speicherbedarf
 
 -- ###########################################################################################
 -- ### RoadMap für die Planung der Optimierung von Datenbank-Struktur und Abfrageverhalten ###
@@ -697,7 +738,7 @@ DataBase  > Reports  > Standard Reports > Disc Usage by TOP Tables
 
 	nicht immer ist gesagt, dass es klappt mit Maßnahmen deutlich viel einzusparen
 	Tools -> Options -> Designers -> Table Designer.. -> 'Prevent saving changes..'
-	Beispiel: Table [DESIGN] -> date statt datetime -> Änderungsskript generieren...
+	Beispiel: Table [DESIGN] -> date statt datetime2 -> Änderungsskript generieren...
 
 -- ######################################################
 
@@ -708,15 +749,21 @@ DataBase  > Reports  > Standard Reports > Disc Usage by TOP Tables
 -- Voraussetzung für Messung:
 
 	create table tab2 (id int identity, SpalteX char(4100))
-	
+	GO
 	insert into tab2
 	select '##'
 	GO 20000
 
 	set statistics io, time on
 	select * from tab2
+
+	logical reads 20000, CPU time = 547 ms,  elapsed time = 2447 ms
 	
 -- Kompression
+
+	select * from tab2
+
+	logical reads 33, CPU time = 531 ms,  elapsed time = 2449 ms
 
 	KompressionsTypen | ROW <> PAGE
 	ROW 
@@ -728,7 +775,7 @@ DataBase  > Reports  > Standard Reports > Disc Usage by TOP Tables
 		Beispiel: [ Deutschland = D ] und verpackt es dann gemäß 'ZIP'-Muster
 
 --	RAM : ungefähr gleich geblieben
-	-->	Seiten werden 1:1 in RAM, daher werden die komprimierten Seiten (28) in RAM gelegt
+	-->	Seiten werden 1:1 in RAM, daher werden die komprimierten Seiten (33) in RAM gelegt
 
 --	CPU : stark schwankend
 	--> deutlich weniger Seiten --> CPU weniger
@@ -777,7 +824,10 @@ DataBase  > Reports  > Standard Reports > Disc Usage by TOP Tables
 USE [Northwind]
 GO
 
-select * from dbo.KundeUmsatz
+select COUNT(*) from dbo.KundeUmsatz
+
+	TSQL-$		CTP		MaxDOP		CPU		TIME
+	31 $		5 $		0 = MAX		235		115
 
 SELECT * INTO demo1 FROM dbo.KundeUmsatz
 GO
@@ -801,7 +851,12 @@ SELECT D1.City
 	, SUM (D2.Freight)
 FROM dbo.demo1 AS D1 INNER JOIN dbo.demo2 AS D2 ON D1.CustomerID = D2.CustomerID
 GROUP BY D1.City
+OPTION (MaxDOP 1)
 
+	TSQL-$		CTP		MaxDOP		CPU		TIME
+	78 $		5 $		0 = MAX		3360	1491
+	88 $		100$		1		2047	2229
+	78 $		50$			4		2563	1362
 
 -- ### Maler-Beispiel #########################################################################
 
@@ -843,7 +898,7 @@ where orderid = 10333 option (maxdop 4) --nimm nicht mehr als 4 ,
 	-- > Deshalb lieber TSQL MaxDOP Options wählen, um das "im Kleinen" zu testen
 -- Faustregeln, da CTP von 005 SQL$ im Standard einfach absurd wenig ist
 	-- > OLTP (ShopSystem) 50% der CPUs und setze CTP auf 25
-	-- > OLAP (DatenBank)  CTP auf 50 und 
+	-- > OLAP (DatenBank)  CTP auf 50 und 25% ... 75% CPU
 
 -- ###########################################################################################
 -- ###########################################################################################
@@ -903,7 +958,12 @@ select * into kundeumsatz2 from dbo.KundeUmsatz -- Kopie Tabelle in eine neue Ta
 
 -- ### SCAN HEAP
 
-	'[...]'
+GO
+SELECT * FROM dbo.KundeUmsatz
+
+
+
+
 
 
 
