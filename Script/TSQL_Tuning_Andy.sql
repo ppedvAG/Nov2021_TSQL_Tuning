@@ -959,32 +959,144 @@ select * into kundeumsatz2 from dbo.KundeUmsatz -- Kopie Tabelle in eine neue Ta
 -- ### SCAN HEAP
 
 GO
-SELECT * FROM dbo.KundeUmsatz
+SELECT * FROM dbo.KundeUmsatz			-- PAGES : 57.000, CPU time = 3953 ms,  elapsed time = 40988 ms 
+
+SELECT TOP 3 * FROM dbo.KundeUmsatz
+
+ALTER TABLE dbo.KundeUmsatz ADD [kid] INT IDENTITY 
+
+SET STATISTICS IO, TIME ON
+
+SELECT kid FROM dbo.KundeUmsatz WHERE kid = 1000	-- 57.000 PAGES, CPU time = 172 ms,  elapsed time = 182 ms
+
+	-- aktuell kein INDEX > TABLE SCAN
+
+	' NONCLUSTERED INDEX [kid] UNIQUE ' = IDX_kid
+
+SELECT kid FROM dbo.KundeUmsatz WHERE kid = 1000	-- 3 PAGES, CPU time = 0 ms,  elapsed time = 0 ms
+
+-- ### Sonderfall PROCEDURES
+
+SELECT * FROM dbo.KundeUmsatz WHERE kid < 2
+
+CREATE PROCEDURE [demo] @kid INT
+AS
+SELECT * FROM dbo.KundeUmsatz WHERE kid < @kid
+
+EXEC demo 2
+
+SELECT * FROM dbo.KundeUmsatz WHERE kid < 2
+
+-- #######
+
+SELECT kid, CompanyName FROM dbo.KundeUmsatz WHERE kid = 1000
+
+	' NONCLUSTERED INDEX [kid, companyname] UNIQUE ' = UNIQUE COMBINED COVERED NC IDX
+
+	>> UNIQUE = kid kommt nur einmal vor
+	>> COMBINED = mehrere Spalten werden in den INDEX aufgenommen 'BIS zur Wurzel!'
+	>> COVERED = INDEX bedient zu 100% die Abfrage = deckt Abfrage ab
+
+	' einfach alles in den INDEX aufnehmen? '
+	-- MAXIMAL 16 Spalten erlaubt, wobei dieser den IDX unnötig aufbläht
+		-- MAXIMAL erlaubt Schlüssel-Länge := 900 Byte #isso #microsoft #magic
+	-- in der Praxis selten mehr als 4 Eigenschaften notwendig für Eindeutigkeit
+		-- Bsp. Land > Ort > Straße = das reicht zum VORFILTERN 
+		-- Ziel ist nicht EXAKTHEIT, sondern RELATIV wenige Datensätze > RELATIV wenige Logische I/O
+		-- UNIQUE ITEM = EINDEUTIGKEIT > EFFEKTIV & EFFIZENT 
+	--> einfach alles in den INDEX aufnehmen ist KEINE gute Idee!!
+
+	' INCLUDING INDEX ist des (potentiell) beste Index '
+	-- er belastet NICHT den Baum > er produziert "nur" größere INDEX-Blätter 
+		-- der Rest wird dann als TABLE LOOKUP nachgeschlagen 2010:1011:705:03 (siehe Excel "Dieter")
+		-- MAXIMAL 1.000 Spalten können als INCLUDING Spalten aufgenommen werden
+
+SELECT kid, CompanyName FROM dbo.KundeUmsatz WHERE kid = 1000
+
+	' Fragestellungen Teil 1 '
+	-- Was brauche ich für EINDEUTIGKEIT im INDEX?						INDEX
+	-- Was kann ich getrost auch noch auf Blatt-Ebene herausfinden?		INCLUDING
+		--> Frage ich REGELMÄßIG nach dieser Information? 
+	-- Was jann ich auch noch nachträglich nachschlagen?				LOOKUP
+
+	' NC IDX UNIQUE [kid] INCL [companyname] '
+
+SELECT						-- VORAUSSETZUNG = ich frage REGELMÄßIG danach!! 
+	kid
+	, Country				-- nach diesen Infos interessiere ich mich ZUSÄTZLICH
+	, City					-- mit-aufgenommen = inkludiert werden > INCLUDING 
+	, CompanyName
+FROM dbo.KundeUmsatz		-- RAW DATA
+WHERE kid = 1000			-- FILTERN > INDEX > Schüssel-Spalten = UNIQUE 
+
+	' ##### Hackordnung
+
+	INDEX SEEK   = gezieltes FINDEN im INDEX
+	INDEX SCAN	 = SUCHEN innerhalb von INDEX-Blättern; weniger Pages als Raw Data
+	TABLE LOOKUP = EINZELNE Datensätze FINDEN in Raw Data
+	TABLE SCAN   = SUCHEN innerhalb ALLER Datensätze der Raw Data; schlechter geht nicht! '
 
 
+GO		-- Abfrage durchführen > grüner Text im EXEC Plan > Rechtsklick > Missing INDEX = Real-Hypoth. INDEX
+SELECT
+	CompanyName
+	, ProductName
+FROM dbo.KundeUmsatz
+WHERE shipcity = 'Berlin'
+
+	' NC IDX [shipcity] INCL [cname, productname] '		-- THEORETISCHE INDEX, weil von uns erdacht
 
 
+SELECT						-- 000.001 ITEM
+	kid
+	, CompanyName
+FROM dbo.KundeUmsatz
+WHERE kid = 1000			-- hier schon INDEX SEEK
+
+SELECT						-- 167.936 ITEM
+	kid
+	, CompanyName
+FROM dbo.KundeUmsatz		-- davor Table SCAN = 57.000 PAGES
+WHERE country ='Germany'	-- NC IDX [country] INCL [kid, cname] erzeugt INDEX SEEK
+
+SELECT
+	kid
+	, CompanyName
+FROM dbo.KundeUmsatz 
+WHERE kid = 1000
+		OR country ='Germany'	-- INDEX SCAN = 10.000 PAGES 
+
+		' GermanyX - Test '
+
+		Das THEORETISCHE Optimum = 2x SEEK + MERGE JOIN über Ergebnisse 
+		>> SQL SVR hat "keine Lust" auf dieses Optimum 
+		>> Alternativer Lösungsansatz : UNION ALL			--< PRAKTISCHE OPTIMUM
+		<< keine gute Lösung : FROM dbo.KundeUmsatz WITH ( INDEX = IDX_kid )
+
+GO
+SELECT			-- INDEX SEEK : geil ; 900 PAGES : sub-geil ; 0.8 $
+	city
+	, CompanyName
+FROM dbo.KundeUmsatz
+WHERE	CustomerID LIKE 'W%'
+		AND
+		Country = 'Finland'
+
+		' es geht noch besser : IDX NC [custID] INCL [ city, cname ] FILTERED [Country = "Finland"] '
+
+-- INDEX SEEK : geil ; 230 PAGES : geil ; 0.1 $ ; SUPIIIIII :)
+
+		' packe ich jetzt [Country] in der Filter oder [customerID] ? '
+
+-- Was ist selektiver? > WENIGER PAGES in meinen INDEX?!
+
+		'W%' = 80.000 ROWS   <> 'Finland' = 28.000		;  DISTINCT  ; IS NULL ; #Abfragen
 
 
+-- ### CLUSTERED INDEX = der HIGHLANDER 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-					
+SELECT * FROM dbo.KundeUmsatz	
+	
 	'CL ist gut für Bereichsabfragen, aber PK ist eindeutig; ID ; aber wir verlieren durch PK als CL IX 
 	auf ID Spalten, die Möglichkeit	den CL IX auf Spalten zu vergeben, die häufig mit Bereichsabfragen
 	untersucht werden >>> PK muss NICHT ein CUSTERED INDEX sein!!
@@ -1202,187 +1314,6 @@ select * from sys.dm_db_index_physical_stats
 	 NULL,
 	 'detailed'									-- [ROW_OVERFLOW_DATA] = 150 zusätzliche Seiten
 	)
-
--- ######################################################
-
--- ###### Partionierung der Sicht via Salami-Taktik #####
-
--- ######################################################
-
--- ### Problem: UMSATZ 
-
-create table u2018 (id int identity, jahr int, spx int) 
-create table u2017 (id int identity, jahr int, spx int)
-create table u2016 (id int identity, jahr int, spx int)
-create table u2015 (id int, jahr int, spx int)
-
--- VIEW wird erstellt mit allen Daten
-
-create view Umsatz
-as
-select * from u2018
-UNION ALL			--wichtig: keine doppelten DS möglich
-select * from u2017
-UNION ALL
-select * from u2016
-UNION ALL
-select * from u2015
-
-select * from umsatz -- alle Tabellen
-
-select * from umsatz where jahr = 2017 -- immer noch ALLE Tabellen
-
-alter view dbo.umsatz with schemabinding
-as
-select * from u2018
-UNION ALL			--wichtig: keine doppelten DS möglich
-select * from u2017
-UNION ALL
-select * from u2016
-UNION ALL
-select * from u2015
-
--- CONSTRAINT-Lösung
-
-ALTER TABLE dbo.u2015 ADD CONSTRAINT
-	CK_u2015 CHECK (jahr=2015)
-
-ALTER TABLE dbo.u2016 ADD CONSTRAINT
-	CK_u2016 CHECK (jahr=2016)
-
-ALTER TABLE dbo.u2017 ADD CONSTRAINT
-	CK_u2017 CHECK (jahr=2017)
-
-ALTER TABLE dbo.u2018 ADD CONSTRAINT
-	CK_u2018 CHECK (jahr=2018)
-
-SELECT * FROM umsatz WHERE jahr = 2017 --> über CONSTRAINTs Stück für Stück einschränken
-
-SELECT * FROM umsatz WHERE jahr = 2011 --> bewirkt CONSTANT SCAN, da 2011 nicht existieren kann (KEINE Tabelle)
-
-select * from umsatz where id = 2011   --> immer noch alle Tabellen
-
--- SEQUENZ-Lösung (internes Programm)
-
-CREATE SEQUENCE [dbo].[mySEQ] 
- AS [bigint]
- START WITH 1
- INCREMENT BY 1
- 
-insert into umsatz(id, jahr, spx) values (next value for mySEQ, 2016, 4)
-
-insert into umsatz(id, jahr, spx) values (next value for mySEQ, 2017, 3)
-
-insert into umsatz(id, jahr, spx) values (next value for mySEQ, 2018, 3)
-
-
-select * from umsatz
-where id = 100			--< wieder SCAN 
-
--- ######################################################
-
--- ###### Physische Partitionierung der Datensätze ######
-
--- ######################################################
-
-create table tab (id int) --würde so immer auf [PRIMARY] liegen
-
-	'Dateigruppe erstellen > Logischer Name für Aufruf'
-
-create table tab21 (id int) on XY -- als Beispiel
-
---  Dateigruppen anzulegen (bis100   | bis200    | Rest)
-			'LOGICAL NAME : nwbis100 | nwbis200  | nwRest'
-
-	'int Wert nehmen
-
-    -2,1 MRD--------100]------------200]----------------  +2,1Mrd
-	            1             2               3	'
-
--- "isolierte" physikalische Bereiche
-	-- bis zu  1.000 Bereiche bis SQL 2005 
-	-- bis zu 15.000 Bereiche ab  SQL 2008
-
--- Partition FUNCTION()
-
-create partition function fZahl1(int)
-as
-RANGE LEFT FOR VALUES (100,200)
-
-select $partition.fzahl1(201)		--  1 oder 2 oder 3 
-
--- Partition SCHEMA
-
-create partition scheme schZahl2
-as
-partition fzahl1 to (nwbis100,nwbis200,nwrest) 
-
-	'alle nwbisxxx sind die Filegroups/Dateigruppen > VORHER angelegt
-		logischer Name: bis100 | bis200 |  Rest
------------------------  1			2	     3   --------------------'
-
--- Tabelle erstellen und Zahlen schreiben
-
-create table ptab1 (id int identity, nummer int, spx char(4100))
-ON schZahl2(nummer)	
-
-	set statistics io, time off	-- Statistik abschalten, sonst dauert das ewig!
-
-	declare @i as int = 1
-
-	while @i <= 20001			-- 20.000 Werte, aufsteigend gezählt
-		BEGIN
-			insert into ptab1 values(@i, 'XY')
-			set @i+=1
-		END		
-
--- ### aktuelle Übersicht der Partitionierung
-
-select $partition.fzahl1(nummer), min(nummer), max(nummer), count(*)
-from ptab1
-group by $partition.fzahl1(nummer)
-
--- ##### Ist das akademisch oder hat das einen "echten" Nutzen?
-
--- Ändere das Schema zum Ergänzen von nwbis5000
-alter partition scheme schZahl2 next used nwbis5000
-select * from ptab1 where nummer = 1110					-- noch keine Auswirkung
-
--- Schema anpassen
-
-alter partition function fzahl1() split Range (5000)	-- neue Grenze einziehen
-
-alter partition function fzahl1() merge range(100)		-- untere Grenze verschmelzen
-
-select * from ptab1 where nummer = 11  
-
--- ##### Grenze entfernen: 100
-
-----x-------200--------5000--------------- betroffen : partition function ()
---     1            2           3          betroffen : Scheme und DataGroups
-
--- ##### ARCHIV-Funktion
-
-create table archiv
-	(id int not null, nummer int, spx char(4100)) on bis200
-
---es gibt kein TSQL Statement zum Verschieben von Datensätzen
-	--hier schon ;-)
-
-alter table ptab1 switch partition 1 to archiv
-
-select * from archiv  -- alle von 1 bis 200
-
--- ##### Sonderfall : DATUM
-
-create partition function fZahl(datetime) --> 
-as
-RANGE LEFT FOR VALUES ('31.12.20xx 23:59:59.999','')
-
-	-- Verständnisfragen
-
-	-- Kunden von A bis E  &&  von F bis R  &&   Rest
-	
 
 -- ######################################################
 
